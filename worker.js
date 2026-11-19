@@ -18,6 +18,22 @@ const VK_KEYBOARD = {
   ],
 };
 
+const DAILY_PHOTO_LIMIT = 50;
+const MAX_DOCUMENT_BYTES = 4 * 1024 * 1024;
+const MAX_BLOB_BYTES = 10 * 1024 * 1024;
+
+const ERR_FORWARD = "не удалось переслать фото, попробуйте ещё раз";
+const ERR_DOWNLOAD = "не удалось скачать фото, попробуйте ещё раз";
+const ERR_TOO_BIG = "файл слишком большой, попробуйте ещё раз с меньшим фото";
+const ERR_DOC_TOO_BIG = "файл больше 4 мб, пришлите как обычное фото";
+const ERR_ALBUM = "альбомы не поддерживаются, пришлите фото по одному";
+const ERR_LIMIT = "дневной лимит фото закончился, попробуйте завтра";
+const ERR_ONLY_PHOTO = "можно отправлять только фотографии";
+const ERR_NO_PARTNER = "у вас нет собеседника, отправьте код подключения или поделитесь своим";
+const ERR_NO_START = "нажмите /start для регистрации";
+const ERR_PARTNER_LEFT = "собеседник отвязал мост";
+const OK_DELIVERED = "сообщение доставлено";
+
 // ============ ГЕНЕРАЦИЯ КЛЮЧА ============
 
 function randomLetter() { return String.fromCharCode(97 + Math.floor(Math.random() * 26)); }
@@ -54,7 +70,31 @@ async function saveOwnerByKey(env, key, owner) {
   await env.BOT_KV.put(`bridgekey:${key}`, JSON.stringify(owner));
 }
 
-// ============ ОТПРАВКА СООБЩЕНИЙ ============
+// ============ ДНЕВНОЙ ЛИМИТ ============
+
+function todayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function consumePhotoQuota(env) {
+  const key = `photo_count:${todayKey()}`;
+  const countStr = await env.BOT_KV.get(key);
+  const count = countStr ? parseInt(countStr, 10) : 0;
+  if (count >= DAILY_PHOTO_LIMIT) return false;
+  await env.BOT_KV.put(key, String(count + 1), { expirationTtl: 90000 });
+  return true;
+}
+
+async function refundPhotoQuota(env) {
+  const key = `photo_count:${todayKey()}`;
+  const countStr = await env.BOT_KV.get(key);
+  const count = countStr ? parseInt(countStr, 10) : 0;
+  if (count > 0) {
+    await env.BOT_KV.put(key, String(count - 1), { expirationTtl: 90000 });
+  }
+}
+
+// ============ ОТПРАВКА ============
 
 async function sendTg(env, chatId, text, replyMarkup) {
   const payload = { chat_id: chatId, text };
@@ -66,15 +106,57 @@ async function sendTg(env, chatId, text, replyMarkup) {
   });
 }
 
-async function sendVk(env, userId, text, keyboard) {
+async function sendTgPhotoFileId(env, chatId, fileId, caption) {
   const params = new URLSearchParams({
-    access_token: env.VK_TOKEN, v: "5.131",
-    user_id: String(userId), message: text,
+    chat_id: String(chatId),
+    photo: fileId,
+  });
+  if (caption) params.set("caption", caption.slice(0, 1024));
+  await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendPhoto`, {
+    method: "POST",
+    body: params,
+  });
+}
+
+async function sendTgPhotoBlob(env, chatId, blob, caption) {
+  const formData = new FormData();
+  formData.append("chat_id", String(chatId));
+  formData.append("photo", blob, "photo.jpg");
+  if (caption) formData.append("caption", caption.slice(0, 1024));
+  const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendPhoto`, {
+    method: "POST",
+    body: formData,
+  });
+  return res.ok;
+}
+
+async function sendTgPhotoUrl(env, chatId, url, caption) {
+  const params = new URLSearchParams({
+    chat_id: String(chatId),
+    photo: url,
+  });
+  if (caption) params.set("caption", caption.slice(0, 1024));
+  const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendPhoto`, {
+    method: "POST",
+    body: params,
+  });
+  const data = await res.json();
+  return data.ok === true;
+}
+
+async function sendVk(env, userId, text, keyboard, attachment) {
+  const params = new URLSearchParams({
+    access_token: env.VK_TOKEN,
+    v: "5.131",
+    user_id: String(userId),
     random_id: String(Math.floor(Math.random() * 2147483647)),
   });
+  if (text) params.set("message", text);
   if (keyboard) params.set("keyboard", JSON.stringify(keyboard));
+  if (attachment) params.set("attachment", attachment);
   await fetch("https://api.vk.com/method/messages.send", {
-    method: "POST", body: params,
+    method: "POST",
+    body: params,
   });
 }
 
@@ -83,12 +165,14 @@ async function sendMessage(env, platform, chatId, text, replyMarkup) {
   else if (platform === "vk") await sendVk(env, chatId, text, replyMarkup);
 }
 
-// ============ ИМЯ VK ============
+// ============ VK USERNAME ============
 
 async function getVkUsername(env, userId) {
   try {
     const params = new URLSearchParams({
-      access_token: env.VK_TOKEN, v: "5.131", user_ids: String(userId),
+      access_token: env.VK_TOKEN,
+      v: "5.131",
+      user_ids: String(userId),
     });
     const res = await fetch("https://api.vk.com/method/users.get?" + params);
     const data = await res.json();
@@ -100,7 +184,298 @@ async function getVkUsername(env, userId) {
   return "пользователь vk";
 }
 
-// ============ ОСНОВНАЯ ЛОГИКА ============
+// ============ VK UPLOAD ============
+
+async function uploadPhotoToVk(env, peerId, blob) {
+  // 1. get upload server
+  const serverRes = await fetch(
+    `https://api.vk.com/method/photos.getMessagesUploadServer?peer_id=${peerId}&access_token=${env.VK_TOKEN}&v=5.131`
+  );
+  const serverData = await serverRes.json();
+  if (!serverData.response || !serverData.response.upload_url) {
+    return null;
+  }
+
+  // 2. upload file
+  const formData = new FormData();
+  formData.append("photo", blob, "photo.jpg");
+  const uploadRes = await fetch(serverData.response.upload_url, {
+    method: "POST",
+    body: formData,
+  });
+  const uploaded = await uploadRes.json();
+  if (!uploaded.photo || !uploaded.hash || uploaded.server === undefined) {
+    return null;
+  }
+
+  // 3. save
+  const saveParams = new URLSearchParams({
+    access_token: env.VK_TOKEN,
+    v: "5.131",
+    server: String(uploaded.server),
+    photo: uploaded.photo,
+    hash: uploaded.hash,
+  });
+  const saveRes = await fetch("https://api.vk.com/method/photos.saveMessagesPhoto", {
+    method: "POST",
+    body: saveParams,
+  });
+  const saved = await saveRes.json();
+  if (!saved.response || !saved.response[0]) {
+    return null;
+  }
+
+  const photo = saved.response[0];
+  return `photo${photo.owner_id}_${photo.id}`;
+}
+
+// ============ TG MEDIA HANDLER ============
+
+async function handleTgMedia(update, env) {
+  const msg = update.message;
+  const chatId = msg.chat.id;
+  try {
+    const from = msg.from;
+    if (!from) return;
+
+    const userId = from.id;
+    const username = from.username ? "@" + from.username : (from.first_name || "пользователь");
+    const caption = (msg.caption || "").trim();
+    const captionText = caption ? `фото от ${username}: ${caption}` : `фото от ${username}`;
+
+    // Альбом
+    if (msg.media_group_id) {
+      const dedupKey = `album:${chatId}:${msg.media_group_id}`;
+      const already = await env.BOT_KV.get(dedupKey);
+      if (!already) {
+        await env.BOT_KV.put(dedupKey, "1", { expirationTtl: 60 });
+        await sendTg(env, chatId, ERR_ALBUM);
+      }
+      return;
+    }
+
+    // Bridge
+    const myBridge = await getBridge(env, "tg", userId);
+    if (!myBridge) { await sendTg(env, chatId, ERR_NO_START); return; }
+    if (!myBridge.partnerPlatform || myBridge.partnerId === null) {
+      await sendTg(env, chatId, ERR_NO_PARTNER);
+      return;
+    }
+
+    // Partner verification
+    const partnerBridge = await getBridge(env, myBridge.partnerPlatform, myBridge.partnerId);
+    if (
+      !partnerBridge ||
+      partnerBridge.partnerPlatform !== "tg" ||
+      String(partnerBridge.partnerId) !== String(userId)
+    ) {
+      await sendTg(env, chatId, ERR_PARTNER_LEFT);
+      return;
+    }
+
+    // Определить file_id
+    let fileId = null;
+    let isDocument = false;
+    if (msg.document) {
+      if (!msg.document.mime_type || !msg.document.mime_type.startsWith("image/")) {
+        await sendTg(env, chatId, ERR_ONLY_PHOTO);
+        return;
+      }
+      if (msg.document.file_size && msg.document.file_size > MAX_DOCUMENT_BYTES) {
+        await sendTg(env, chatId, ERR_DOC_TOO_BIG);
+        return;
+      }
+      fileId = msg.document.file_id;
+      isDocument = true;
+    } else if (msg.photo && msg.photo.length > 0) {
+      const photos = msg.photo;
+      const chosen = photos.length >= 2 ? photos[photos.length - 2] : photos[photos.length - 1];
+      fileId = chosen.file_id;
+    }
+
+    if (!fileId) return;
+
+    // Лимит
+    if (!(await consumePhotoQuota(env))) {
+      await sendTg(env, chatId, ERR_LIMIT);
+      return;
+    }
+
+    const partnerPlatform = myBridge.partnerPlatform;
+    const partnerId = myBridge.partnerId;
+
+    // Быстрый путь: фото -> TG, без скачивания
+    if (partnerPlatform === "tg" && !isDocument) {
+      await sendTgPhotoFileId(env, partnerId, fileId, captionText);
+      await sendTg(env, chatId, OK_DELIVERED);
+      return;
+    }
+
+    // Скачать из TG
+    const getFileRes = await fetch(
+      `https://api.telegram.org/bot${env.BOT_TOKEN}/getFile?file_id=${fileId}`
+    );
+    const fileData = await getFileRes.json();
+    if (!fileData.ok || !fileData.result || !fileData.result.file_path) {
+      await refundPhotoQuota(env);
+      await sendTg(env, chatId, ERR_DOWNLOAD);
+      return;
+    }
+
+    const fileRes = await fetch(
+      `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${fileData.result.file_path}`
+    );
+    if (!fileRes.ok) {
+      await refundPhotoQuota(env);
+      await sendTg(env, chatId, ERR_DOWNLOAD);
+      return;
+    }
+    const blob = await fileRes.blob();
+
+    if (blob.size > MAX_BLOB_BYTES) {
+      await refundPhotoQuota(env);
+      await sendTg(env, chatId, ERR_TOO_BIG);
+      return;
+    }
+
+    if (partnerPlatform === "tg") {
+      const ok = await sendTgPhotoBlob(env, partnerId, blob, captionText);
+      if (!ok) {
+        await refundPhotoQuota(env);
+        await sendTg(env, chatId, ERR_FORWARD);
+        return;
+      }
+      await sendTg(env, chatId, OK_DELIVERED);
+    } else if (partnerPlatform === "vk") {
+      const attachment = await uploadPhotoToVk(env, partnerId, blob);
+      if (!attachment) {
+        await refundPhotoQuota(env);
+        await sendTg(env, chatId, ERR_FORWARD);
+        return;
+      }
+      const sendParams = new URLSearchParams({
+        access_token: env.VK_TOKEN,
+        v: "5.131",
+        user_id: String(partnerId),
+        message: captionText,
+        attachment,
+        random_id: String(Math.floor(Math.random() * 2147483647)),
+      });
+      const sendRes = await fetch("https://api.vk.com/method/messages.send", {
+        method: "POST",
+        body: sendParams,
+      });
+      const sendData = await sendRes.json();
+      if (sendData.error) {
+        await refundPhotoQuota(env);
+        await sendTg(env, chatId, ERR_FORWARD);
+        return;
+      }
+      await sendTg(env, chatId, OK_DELIVERED);
+    }
+  } catch (e) {
+    console.error("TG MEDIA ERROR:", e.message, e.stack);
+    try { await refundPhotoQuota(env); } catch (e1) {}
+    try { await sendTg(env, chatId, ERR_FORWARD); } catch (e2) {}
+  }
+}
+
+// ============ VK MEDIA HANDLER ============
+
+async function handleVkMedia(body, env) {
+  const msg = body.object.message;
+  const userId = msg.from_id;
+  try {
+    const username = await getVkUsername(env, userId);
+    const caption = (msg.text || "").trim();
+    const captionText = caption ? `фото от ${username}: ${caption}` : `фото от ${username}`;
+
+    const photoAttachments = (msg.attachments || []).filter(a => a.type === "photo");
+    if (photoAttachments.length === 0) return;
+
+    // Альбом = >1 фото в одном сообщении
+    if (photoAttachments.length > 1) {
+      await sendVk(env, userId, ERR_ALBUM);
+      return;
+    }
+
+    const myBridge = await getBridge(env, "vk", userId);
+    if (!myBridge) { await sendVk(env, userId, ERR_NO_START); return; }
+    if (!myBridge.partnerPlatform || myBridge.partnerId === null) {
+      await sendVk(env, userId, ERR_NO_PARTNER);
+      return;
+    }
+
+    const partnerBridge = await getBridge(env, myBridge.partnerPlatform, myBridge.partnerId);
+    if (
+      !partnerBridge ||
+      partnerBridge.partnerPlatform !== "vk" ||
+      String(partnerBridge.partnerId) !== String(userId)
+    ) {
+      await sendVk(env, userId, ERR_PARTNER_LEFT);
+      return;
+    }
+
+    if (!(await consumePhotoQuota(env))) {
+      await sendVk(env, userId, ERR_LIMIT);
+      return;
+    }
+
+    const photo = photoAttachments[0].photo;
+    const sizes = photo.sizes || [];
+    if (sizes.length === 0) {
+      await refundPhotoQuota(env);
+      await sendVk(env, userId, ERR_FORWARD);
+      return;
+    }
+    let chosen = sizes.find(s => s.type === "y") || sizes.find(s => s.type === "x");
+    if (!chosen) {
+      chosen = sizes.reduce((max, s) => (s.width * s.height > max.width * max.height ? s : max), sizes[0]);
+    }
+    const url = chosen.url;
+
+    const partnerPlatform = myBridge.partnerPlatform;
+    const partnerId = myBridge.partnerId;
+
+    if (partnerPlatform === "tg") {
+      const ok = await sendTgPhotoUrl(env, partnerId, url, captionText);
+      if (!ok) {
+        await refundPhotoQuota(env);
+        await sendVk(env, userId, ERR_FORWARD);
+        return;
+      }
+      await sendVk(env, userId, OK_DELIVERED);
+    } else if (partnerPlatform === "vk") {
+      let attachment = `photo${photo.owner_id}_${photo.id}`;
+      if (photo.access_key) attachment += `_${photo.access_key}`;
+      const sendParams = new URLSearchParams({
+        access_token: env.VK_TOKEN,
+        v: "5.131",
+        user_id: String(partnerId),
+        message: captionText,
+        attachment,
+        random_id: String(Math.floor(Math.random() * 2147483647)),
+      });
+      const sendRes = await fetch("https://api.vk.com/method/messages.send", {
+        method: "POST",
+        body: sendParams,
+      });
+      const sendData = await sendRes.json();
+      if (sendData.error) {
+        await refundPhotoQuota(env);
+        await sendVk(env, userId, ERR_FORWARD);
+        return;
+      }
+      await sendVk(env, userId, OK_DELIVERED);
+    }
+  } catch (e) {
+    console.error("VK MEDIA ERROR:", e.message, e.stack);
+    try { await refundPhotoQuota(env); } catch (e1) {}
+    try { await sendVk(env, userId, ERR_FORWARD); } catch (e2) {}
+  }
+}
+
+// ============ ТЕКСТОВАЯ ЛОГИКА ============
 
 async function processMessage(msg, env) {
   const { platform, userId, chatId, username, text } = msg;
@@ -151,7 +526,6 @@ async function processMessage(msg, env) {
     return;
   }
 
-  // ---- создать мост ----
   if (text === "создать мост") {
     if (!myBridge) {
       const key = await generateUniqueKey(env);
@@ -173,7 +547,6 @@ async function processMessage(msg, env) {
     return;
   }
 
-  // ---- просмотреть мост ----
   if (text === "просмотреть мост") {
     if (!myBridge) {
       await sendMessage(env, platform, chatId, "у вас пока нет моста, нажмите создать мост", keyboard);
@@ -197,7 +570,6 @@ async function processMessage(msg, env) {
     return;
   }
 
-  // ---- отвязать мост ----
   if (text === "отвязать мост") {
     if (!myBridge) {
       await sendMessage(env, platform, chatId, "у вас пока нет моста", keyboard);
@@ -240,7 +612,6 @@ async function processMessage(msg, env) {
     return;
   }
 
-  // ---- ввод кода ----
   if (isCodeEntry) {
     const extractedKey = keyMatch[0].toLowerCase();
     const owner = await getOwnerByKey(env, extractedKey);
@@ -287,7 +658,6 @@ async function processMessage(msg, env) {
 
     const ownerName = ownerBridge.myName || "собеседник";
 
-    // отключаем моего старого партнёра
     if (myBridge.partnerPlatform && myBridge.partnerId !== null) {
       const op = myBridge.partnerPlatform;
       const oid = myBridge.partnerId;
@@ -301,7 +671,6 @@ async function processMessage(msg, env) {
       }
     }
 
-    // отключаем старого партнёра владельца кода
     if (ownerBridge.partnerPlatform && ownerBridge.partnerId !== null) {
       const op2 = ownerBridge.partnerPlatform;
       const oid2 = ownerBridge.partnerId;
@@ -315,7 +684,6 @@ async function processMessage(msg, env) {
       }
     }
 
-    // связываем
     myBridge.partnerPlatform = owner.platform;
     myBridge.partnerId = owner.userId;
     myBridge.partnerName = ownerName;
@@ -335,13 +703,13 @@ async function processMessage(msg, env) {
     return;
   }
 
-  // ---- пересылка сообщения ----
+  // Обычное сообщение — пересылка
   if (!myBridge) {
-    await sendMessage(env, platform, chatId, "нажмите /start для регистрации", keyboard);
+    await sendMessage(env, platform, chatId, ERR_NO_START, keyboard);
     return;
   }
   if (!myBridge.partnerPlatform || myBridge.partnerId === null) {
-    await sendMessage(env, platform, chatId, "у вас нет собеседника, отправьте код подключения или поделитесь своим", keyboard);
+    await sendMessage(env, platform, chatId, ERR_NO_PARTNER, keyboard);
     return;
   }
 
@@ -358,15 +726,15 @@ async function processMessage(msg, env) {
     myBridge.partnerId = null;
     myBridge.partnerName = null;
     await saveBridge(env, platform, userId, myBridge);
-    await sendMessage(env, platform, chatId, "собеседник отвязал мост", keyboard);
+    await sendMessage(env, platform, chatId, ERR_PARTNER_LEFT, keyboard);
     return;
   }
 
   await sendMessage(env, partnerPlatform, partnerId, `сообщение от ${username}: ${text}`);
-  await sendMessage(env, platform, chatId, "сообщение доставлено", keyboard);
+  await sendMessage(env, platform, chatId, OK_DELIVERED, keyboard);
 }
 
-// ============ ОБРАБОТЧИК TG ============
+// ============ ОБРАБОТЧИКИ ============
 
 async function handleTelegram(update, env) {
   const message = update && update.message;
@@ -386,13 +754,11 @@ async function handleTelegram(update, env) {
   );
 }
 
-// ============ ОБРАБОТЧИК VK ============
-
 async function handleVk(body, env) {
   if (env.VK_SECRET && body.secret !== env.VK_SECRET) return;
   if (body.type === "message_new") {
     const m = body.object && body.object.message;
-    if (!m || typeof m.text !== "string") return;
+    if (!m || typeof m.text !== "string" || m.text.length === 0) return;
     const userId = m.from_id;
     const username = await getVkUsername(env, userId);
     await processMessage(
@@ -420,18 +786,57 @@ export default {
       if (request.method === "POST") {
         const body = await request.json();
 
+        // VK confirmation
         if (body && body.type === "confirmation") {
-          const confirm = env.VK_CONFIRMATION_CODE || "";
-          return new Response(confirm, {
+          return new Response(env.VK_CONFIRMATION_CODE || "", {
             status: 200,
             headers: { "Content-Type": "text/plain" },
           });
         }
 
+        // Telegram
         if (body && body.update_id) {
-          await handleTelegram(body, env);
-        } else if (body && body.type && body.group_id) {
-          await handleVk(body, env);
+          const msg = body.message;
+          if (!msg) return new Response("OK", { status: 200 });
+
+          const isImageDoc =
+            msg.document &&
+            msg.document.mime_type &&
+            msg.document.mime_type.startsWith("image/");
+          const isMedia =
+            (msg.photo && msg.photo.length > 0) ||
+            msg.document ||
+            msg.media_group_id;
+
+          if (isMedia) {
+            ctx.waitUntil(handleTgMedia(body, env));
+            return new Response("OK", { status: 200 });
+          }
+
+          if (typeof msg.text === "string") {
+            await handleTelegram(body, env);
+          }
+          return new Response("OK", { status: 200 });
+        }
+
+        // VK
+        if (body && body.type && body.group_id) {
+          const msg = body.object && body.object.message;
+          if (!msg) return new Response("OK", { status: 200 });
+
+          const hasAttachments = msg.attachments && msg.attachments.length > 0;
+          const hasPhoto =
+            hasAttachments && msg.attachments.some(a => a.type === "photo");
+
+          if (hasPhoto) {
+            ctx.waitUntil(handleVkMedia(body, env));
+            return new Response("OK", { status: 200 });
+          }
+
+          if (typeof msg.text === "string" && msg.text.length > 0) {
+            await handleVk(body, env);
+          }
+          return new Response("OK", { status: 200 });
         }
       }
     } catch (e) {
