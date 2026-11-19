@@ -2,25 +2,41 @@
 
 const TG_KEYBOARD = {
   keyboard: [
-    [{ text: "создать мост" }],
+    [{ text: "перевыпустить мост" }],
     [{ text: "просмотреть мост" }],
     [{ text: "отвязать мост" }],
   ],
   resize_keyboard: true,
 };
 
+const TG_CONFIRM_KEYBOARD = {
+  keyboard: [[{ text: "да" }, { text: "нет" }]],
+  resize_keyboard: true,
+};
+
 const VK_KEYBOARD = {
   one_time: false,
   buttons: [
-    [{ action: { type: "text", label: "создать мост" }, color: "primary" }],
+    [{ action: { type: "text", label: "перевыпустить мост" }, color: "primary" }],
     [{ action: { type: "text", label: "просмотреть мост" }, color: "primary" }],
     [{ action: { type: "text", label: "отвязать мост" }, color: "negative" }],
+  ],
+};
+
+const VK_CONFIRM_KEYBOARD = {
+  one_time: false,
+  buttons: [
+    [
+      { action: { type: "text", label: "да" }, color: "positive" },
+      { action: { type: "text", label: "нет" }, color: "negative" },
+    ],
   ],
 };
 
 const DAILY_PHOTO_LIMIT = 50;
 const MAX_DOCUMENT_BYTES = 4 * 1024 * 1024;
 const MAX_BLOB_BYTES = 10 * 1024 * 1024;
+const CONFIRM_TTL_MS = 2 * 60 * 1000;
 
 const ERR_FORWARD = "не удалось переслать фото, попробуйте ещё раз";
 const ERR_DOWNLOAD = "не удалось скачать фото, попробуйте ещё раз";
@@ -33,11 +49,16 @@ const ERR_NO_PARTNER = "у вас нет собеседника, отправь�
 const ERR_NO_START = "нажмите /start для регистрации";
 const ERR_PARTNER_LEFT = "собеседник отвязал мост";
 const OK_DELIVERED = "сообщение доставлено";
+const CONFIRM_PROMPT = "вы точно хотите сделать это?";
 
 // ============ ГЕНЕРАЦИЯ КЛЮЧА ============
 
-function randomLetter() { return String.fromCharCode(97 + Math.floor(Math.random() * 26)); }
-function randomDigit() { return String(Math.floor(Math.random() * 10)); }
+function randomLetter() {
+  return String.fromCharCode(97 + Math.floor(Math.random() * 26));
+}
+function randomDigit() {
+  return String(Math.floor(Math.random() * 10));
+}
 
 function generateKeyCandidate() {
   return (
@@ -69,6 +90,11 @@ async function getOwnerByKey(env, key) {
 async function saveOwnerByKey(env, key, owner) {
   await env.BOT_KV.put(`bridgekey:${key}`, JSON.stringify(owner));
 }
+async function deleteOwnerByKey(env, key) {
+  if (key) {
+    await env.BOT_KV.delete(`bridgekey:${key}`);
+  }
+}
 
 // ============ ДНЕВНОЙ ЛИМИТ ============
 
@@ -86,11 +112,15 @@ async function consumePhotoQuota(env) {
 }
 
 async function refundPhotoQuota(env) {
-  const key = `photo_count:${todayKey()}`;
-  const countStr = await env.BOT_KV.get(key);
-  const count = countStr ? parseInt(countStr, 10) : 0;
-  if (count > 0) {
-    await env.BOT_KV.put(key, String(count - 1), { expirationTtl: 90000 });
+  try {
+    const key = `photo_count:${todayKey()}`;
+    const countStr = await env.BOT_KV.get(key);
+    const count = countStr ? parseInt(countStr, 10) : 0;
+    if (count > 0) {
+      await env.BOT_KV.put(key, String(count - 1), { expirationTtl: 90000 });
+    }
+  } catch (e) {
+    console.error("REFUND QUOTA ERROR:", e.message);
   }
 }
 
@@ -112,10 +142,12 @@ async function sendTgPhotoFileId(env, chatId, fileId, caption) {
     photo: fileId,
   });
   if (caption) params.set("caption", caption.slice(0, 1024));
-  await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendPhoto`, {
+  const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendPhoto`, {
     method: "POST",
     body: params,
   });
+  const data = await res.json();
+  return data.ok === true;
 }
 
 async function sendTgPhotoBlob(env, chatId, blob, caption) {
@@ -127,7 +159,9 @@ async function sendTgPhotoBlob(env, chatId, blob, caption) {
     method: "POST",
     body: formData,
   });
-  return res.ok;
+  if (!res.ok) return false;
+  const data = await res.json();
+  return data.ok === true;
 }
 
 async function sendTgPhotoUrl(env, chatId, url, caption) {
@@ -154,15 +188,18 @@ async function sendVk(env, userId, text, keyboard, attachment) {
   if (text) params.set("message", text);
   if (keyboard) params.set("keyboard", JSON.stringify(keyboard));
   if (attachment) params.set("attachment", attachment);
-  await fetch("https://api.vk.com/method/messages.send", {
+  const res = await fetch("https://api.vk.com/method/messages.send", {
     method: "POST",
     body: params,
   });
+  const data = await res.json();
+  return !data.error;
 }
 
 async function sendMessage(env, platform, chatId, text, replyMarkup) {
-  if (platform === "tg") await sendTg(env, chatId, text, replyMarkup);
-  else if (platform === "vk") await sendVk(env, chatId, text, replyMarkup);
+  if (platform === "tg") return await sendTg(env, chatId, text, replyMarkup);
+  if (platform === "vk") return await sendVk(env, chatId, text, replyMarkup);
+  return false;
 }
 
 // ============ VK USERNAME ============
@@ -187,7 +224,6 @@ async function getVkUsername(env, userId) {
 // ============ VK UPLOAD ============
 
 async function uploadPhotoToVk(env, peerId, blob) {
-  // 1. get upload server
   const serverRes = await fetch(
     `https://api.vk.com/method/photos.getMessagesUploadServer?peer_id=${peerId}&access_token=${env.VK_TOKEN}&v=5.131`
   );
@@ -196,7 +232,6 @@ async function uploadPhotoToVk(env, peerId, blob) {
     return null;
   }
 
-  // 2. upload file
   const formData = new FormData();
   formData.append("photo", blob, "photo.jpg");
   const uploadRes = await fetch(serverData.response.upload_url, {
@@ -208,7 +243,6 @@ async function uploadPhotoToVk(env, peerId, blob) {
     return null;
   }
 
-  // 3. save
   const saveParams = new URLSearchParams({
     access_token: env.VK_TOKEN,
     v: "5.131",
@@ -229,6 +263,38 @@ async function uploadPhotoToVk(env, peerId, blob) {
   return `photo${photo.owner_id}_${photo.id}`;
 }
 
+// ============ ХЕЛПЕР ОТВЯЗКИ ПАРТНЁРА ============
+
+async function detachPartnerIfLinked(env, myBridge, myPlatform, myUserId) {
+  if (!myBridge.partnerPlatform || myBridge.partnerId === null) return;
+
+  const partnerPlatform = myBridge.partnerPlatform;
+  const partnerId = myBridge.partnerId;
+
+  myBridge.partnerPlatform = null;
+  myBridge.partnerId = null;
+  myBridge.partnerName = null;
+
+  const partnerBridge = await getBridge(env, partnerPlatform, partnerId);
+  if (
+    partnerBridge &&
+    partnerBridge.partnerPlatform === myPlatform &&
+    String(partnerBridge.partnerId) === String(myUserId)
+  ) {
+    partnerBridge.partnerPlatform = null;
+    partnerBridge.partnerId = null;
+    partnerBridge.partnerName = null;
+    await saveBridge(env, partnerPlatform, partnerId, partnerBridge);
+    await sendMessage(
+      env,
+      partnerPlatform,
+      partnerId,
+      ERR_PARTNER_LEFT,
+      partnerPlatform === "tg" ? TG_KEYBOARD : VK_KEYBOARD
+    );
+  }
+}
+
 // ============ TG MEDIA HANDLER ============
 
 async function handleTgMedia(update, env) {
@@ -243,7 +309,6 @@ async function handleTgMedia(update, env) {
     const caption = (msg.caption || "").trim();
     const captionText = caption ? `фото от ${username}: ${caption}` : `фото от ${username}`;
 
-    // Альбом
     if (msg.media_group_id) {
       const dedupKey = `album:${chatId}:${msg.media_group_id}`;
       const already = await env.BOT_KV.get(dedupKey);
@@ -254,15 +319,23 @@ async function handleTgMedia(update, env) {
       return;
     }
 
-    // Bridge
     const myBridge = await getBridge(env, "tg", userId);
-    if (!myBridge) { await sendTg(env, chatId, ERR_NO_START); return; }
+    if (!myBridge) {
+      await sendTg(env, chatId, ERR_NO_START);
+      return;
+    }
+
+    // Обновляем собственное имя отправителя
+    if (myBridge.myName !== username) {
+      myBridge.myName = username;
+      await saveBridge(env, "tg", userId, myBridge);
+    }
+
     if (!myBridge.partnerPlatform || myBridge.partnerId === null) {
       await sendTg(env, chatId, ERR_NO_PARTNER);
       return;
     }
 
-    // Partner verification
     const partnerBridge = await getBridge(env, myBridge.partnerPlatform, myBridge.partnerId);
     if (
       !partnerBridge ||
@@ -273,7 +346,6 @@ async function handleTgMedia(update, env) {
       return;
     }
 
-    // Определить file_id
     let fileId = null;
     let isDocument = false;
     if (msg.document) {
@@ -295,7 +367,6 @@ async function handleTgMedia(update, env) {
 
     if (!fileId) return;
 
-    // Лимит
     if (!(await consumePhotoQuota(env))) {
       await sendTg(env, chatId, ERR_LIMIT);
       return;
@@ -304,14 +375,17 @@ async function handleTgMedia(update, env) {
     const partnerPlatform = myBridge.partnerPlatform;
     const partnerId = myBridge.partnerId;
 
-    // Быстрый путь: фото -> TG, без скачивания
     if (partnerPlatform === "tg" && !isDocument) {
-      await sendTgPhotoFileId(env, partnerId, fileId, captionText);
+      const ok = await sendTgPhotoFileId(env, partnerId, fileId, captionText);
+      if (!ok) {
+        await refundPhotoQuota(env);
+        await sendTg(env, chatId, ERR_FORWARD);
+        return;
+      }
       await sendTg(env, chatId, OK_DELIVERED);
       return;
     }
 
-    // Скачать из TG
     const getFileRes = await fetch(
       `https://api.telegram.org/bot${env.BOT_TOKEN}/getFile?file_id=${fileId}`
     );
@@ -353,20 +427,8 @@ async function handleTgMedia(update, env) {
         await sendTg(env, chatId, ERR_FORWARD);
         return;
       }
-      const sendParams = new URLSearchParams({
-        access_token: env.VK_TOKEN,
-        v: "5.131",
-        user_id: String(partnerId),
-        message: captionText,
-        attachment,
-        random_id: String(Math.floor(Math.random() * 2147483647)),
-      });
-      const sendRes = await fetch("https://api.vk.com/method/messages.send", {
-        method: "POST",
-        body: sendParams,
-      });
-      const sendData = await sendRes.json();
-      if (sendData.error) {
+      const ok = await sendVk(env, partnerId, captionText, null, attachment);
+      if (!ok) {
         await refundPhotoQuota(env);
         await sendTg(env, chatId, ERR_FORWARD);
         return;
@@ -393,14 +455,23 @@ async function handleVkMedia(body, env) {
     const photoAttachments = (msg.attachments || []).filter(a => a.type === "photo");
     if (photoAttachments.length === 0) return;
 
-    // Альбом = >1 фото в одном сообщении
     if (photoAttachments.length > 1) {
       await sendVk(env, userId, ERR_ALBUM);
       return;
     }
 
     const myBridge = await getBridge(env, "vk", userId);
-    if (!myBridge) { await sendVk(env, userId, ERR_NO_START); return; }
+    if (!myBridge) {
+      await sendVk(env, userId, ERR_NO_START);
+      return;
+    }
+
+    // Обновляем собственное имя отправителя
+    if (myBridge.myName !== username) {
+      myBridge.myName = username;
+      await saveBridge(env, "vk", userId, myBridge);
+    }
+
     if (!myBridge.partnerPlatform || myBridge.partnerId === null) {
       await sendVk(env, userId, ERR_NO_PARTNER);
       return;
@@ -448,20 +519,8 @@ async function handleVkMedia(body, env) {
     } else if (partnerPlatform === "vk") {
       let attachment = `photo${photo.owner_id}_${photo.id}`;
       if (photo.access_key) attachment += `_${photo.access_key}`;
-      const sendParams = new URLSearchParams({
-        access_token: env.VK_TOKEN,
-        v: "5.131",
-        user_id: String(partnerId),
-        message: captionText,
-        attachment,
-        random_id: String(Math.floor(Math.random() * 2147483647)),
-      });
-      const sendRes = await fetch("https://api.vk.com/method/messages.send", {
-        method: "POST",
-        body: sendParams,
-      });
-      const sendData = await sendRes.json();
-      if (sendData.error) {
+      const ok = await sendVk(env, partnerId, captionText, null, attachment);
+      if (!ok) {
         await refundPhotoQuota(env);
         await sendVk(env, userId, ERR_FORWARD);
         return;
@@ -480,44 +539,129 @@ async function handleVkMedia(body, env) {
 async function processMessage(msg, env) {
   const { platform, userId, chatId, username, text } = msg;
   const keyboard = platform === "tg" ? TG_KEYBOARD : VK_KEYBOARD;
+  const confirmKeyboard = platform === "tg" ? TG_CONFIRM_KEYBOARD : VK_CONFIRM_KEYBOARD;
+  const normalized = text.toLowerCase();
 
   let myBridge = await getBridge(env, platform, userId);
 
+  // ---- Обработка подтверждения (да / нет) ----
+  if (myBridge && myBridge.pendingAction) {
+    const isExpired =
+      myBridge.pendingExpiresAt && Date.now() > myBridge.pendingExpiresAt;
+    const action = myBridge.pendingAction;
+
+    if (isExpired) {
+      delete myBridge.pendingAction;
+      delete myBridge.pendingExpiresAt;
+      await saveBridge(env, platform, userId, myBridge);
+    } else if (normalized === "да") {
+      delete myBridge.pendingAction;
+      delete myBridge.pendingExpiresAt;
+      myBridge.myName = username;
+
+      if (action === "reissue") {
+        const oldKey = myBridge.key;
+        await detachPartnerIfLinked(env, myBridge, platform, userId);
+        await deleteOwnerByKey(env, oldKey);
+
+        const newKey = await generateUniqueKey(env);
+        myBridge.key = newKey;
+        await saveBridge(env, platform, userId, myBridge);
+        await saveOwnerByKey(env, newKey, { platform, userId });
+
+        await sendMessage(
+          env,
+          platform,
+          chatId,
+          `мост перевыпущен, ваш новый код подключения: "${newKey}", передайте его собеседнику`,
+          keyboard
+        );
+        return;
+      }
+
+      if (action === "unlink") {
+        if (myBridge.partnerId === null || !myBridge.partnerPlatform) {
+          await saveBridge(env, platform, userId, myBridge);
+          await sendMessage(env, platform, chatId, "у вас нет собеседника", keyboard);
+          return;
+        }
+        await detachPartnerIfLinked(env, myBridge, platform, userId);
+        await saveBridge(env, platform, userId, myBridge);
+        await sendMessage(env, platform, chatId, "мост отвязан", keyboard);
+        return;
+      }
+    } else if (normalized === "нет") {
+      delete myBridge.pendingAction;
+      delete myBridge.pendingExpiresAt;
+      myBridge.myName = username;
+      await saveBridge(env, platform, userId, myBridge);
+      await sendMessage(env, platform, chatId, "действие отменено", keyboard);
+      return;
+    } else {
+      // Если пользователь написал что-то другое вместо да/нет — сбрасываем ожидание и обрабатываем сообщение дальше
+      delete myBridge.pendingAction;
+      delete myBridge.pendingExpiresAt;
+      await saveBridge(env, platform, userId, myBridge);
+    }
+  }
+
   const keyMatch = text.match(/[a-z]{3}-\d{3}-[a-z]{3}/i);
   const isCommand =
-    text === "/start" ||
-    text === "создать мост" ||
-    text === "просмотреть мост" ||
-    text === "отвязать мост";
+    normalized === "/start" ||
+    normalized === "перевыпустить мост" ||
+    normalized === "просмотреть мост" ||
+    normalized === "отвязать мост";
   const isCodeEntry = !isCommand && keyMatch !== null;
 
   // ---- /start ----
-  if (text === "/start") {
+  if (normalized === "/start") {
     if (!myBridge) {
       const key = await generateUniqueKey(env);
       myBridge = {
-        key, myName: username,
-        partnerPlatform: null, partnerId: null, partnerName: null,
+        key,
+        myName: username,
+        partnerPlatform: null,
+        partnerId: null,
+        partnerName: null,
       };
       await saveBridge(env, platform, userId, myBridge);
       await saveOwnerByKey(env, key, { platform, userId });
       await sendMessage(
-        env, platform, chatId,
+        env,
+        platform,
+        chatId,
         `ваш код подключения: "${key}", передайте его собеседнику, или отправьте чужой код для подключения`,
         keyboard
       );
     } else {
       myBridge.myName = username;
+      let actualPartnerName = null;
+      if (myBridge.partnerPlatform && myBridge.partnerId !== null) {
+        const partnerBridge = await getBridge(env, myBridge.partnerPlatform, myBridge.partnerId);
+        if (
+          partnerBridge &&
+          partnerBridge.partnerPlatform === platform &&
+          String(partnerBridge.partnerId) === String(userId)
+        ) {
+          actualPartnerName = partnerBridge.myName || myBridge.partnerName || "собеседник";
+          myBridge.partnerName = actualPartnerName;
+        }
+      }
       await saveBridge(env, platform, userId, myBridge);
-      if (myBridge.partnerId !== null && myBridge.partnerName) {
+
+      if (actualPartnerName) {
         await sendMessage(
-          env, platform, chatId,
-          `ваш код подключения: "${myBridge.key}", ваш собеседник: ${myBridge.partnerName}`,
+          env,
+          platform,
+          chatId,
+          `ваш код подключения: "${myBridge.key}", ваш собеседник: ${actualPartnerName}`,
           keyboard
         );
       } else {
         await sendMessage(
-          env, platform, chatId,
+          env,
+          platform,
+          chatId,
           `ваш код подключения: "${myBridge.key}", у вас нет собеседника`,
           keyboard
         );
@@ -526,43 +670,77 @@ async function processMessage(msg, env) {
     return;
   }
 
-  if (text === "создать мост") {
+  // ---- перевыпустить мост ----
+  if (normalized === "перевыпустить мост") {
     if (!myBridge) {
       const key = await generateUniqueKey(env);
       myBridge = {
-        key, myName: username,
-        partnerPlatform: null, partnerId: null, partnerName: null,
+        key,
+        myName: username,
+        partnerPlatform: null,
+        partnerId: null,
+        partnerName: null,
       };
       await saveBridge(env, platform, userId, myBridge);
       await saveOwnerByKey(env, key, { platform, userId });
-    } else {
-      myBridge.myName = username;
-      await saveBridge(env, platform, userId, myBridge);
+      await sendMessage(
+        env,
+        platform,
+        chatId,
+        `ваш код подключения: "${key}", передайте его собеседнику`,
+        keyboard
+      );
+      return;
     }
-    await sendMessage(
-      env, platform, chatId,
-      `ваш код подключения: "${myBridge.key}", передайте его собеседнику`,
-      keyboard
-    );
+
+    myBridge.myName = username;
+    myBridge.pendingAction = "reissue";
+    myBridge.pendingExpiresAt = Date.now() + CONFIRM_TTL_MS;
+    await saveBridge(env, platform, userId, myBridge);
+    await sendMessage(env, platform, chatId, CONFIRM_PROMPT, confirmKeyboard);
     return;
   }
 
-  if (text === "просмотреть мост") {
+  // ---- просмотреть мост ----
+  if (normalized === "просмотреть мост") {
     if (!myBridge) {
-      await sendMessage(env, platform, chatId, "у вас пока нет моста, нажмите создать мост", keyboard);
+      await sendMessage(env, platform, chatId, "у вас пока нет моста, нажмите /start", keyboard);
       return;
     }
     myBridge.myName = username;
+
+    let actualPartnerName = null;
+    if (myBridge.partnerPlatform && myBridge.partnerId !== null) {
+      const partnerBridge = await getBridge(env, myBridge.partnerPlatform, myBridge.partnerId);
+      if (
+        partnerBridge &&
+        partnerBridge.partnerPlatform === platform &&
+        String(partnerBridge.partnerId) === String(userId)
+      ) {
+        actualPartnerName = partnerBridge.myName || myBridge.partnerName || "собеседник";
+        myBridge.partnerName = actualPartnerName;
+      } else {
+        myBridge.partnerPlatform = null;
+        myBridge.partnerId = null;
+        myBridge.partnerName = null;
+      }
+    }
+
     await saveBridge(env, platform, userId, myBridge);
-    if (myBridge.partnerId !== null && myBridge.partnerName) {
+
+    if (actualPartnerName) {
       await sendMessage(
-        env, platform, chatId,
-        `ваш код подключения: "${myBridge.key}", ваш собеседник: ${myBridge.partnerName}`,
+        env,
+        platform,
+        chatId,
+        `ваш код подключения: "${myBridge.key}", ваш собеседник: ${actualPartnerName}`,
         keyboard
       );
     } else {
       await sendMessage(
-        env, platform, chatId,
+        env,
+        platform,
+        chatId,
         `ваш код подключения: "${myBridge.key}", у вас нет собеседника`,
         keyboard
       );
@@ -570,7 +748,8 @@ async function processMessage(msg, env) {
     return;
   }
 
-  if (text === "отвязать мост") {
+  // ---- отвязать мост ----
+  if (normalized === "отвязать мост") {
     if (!myBridge) {
       await sendMessage(env, platform, chatId, "у вас пока нет моста", keyboard);
       return;
@@ -583,35 +762,14 @@ async function processMessage(msg, env) {
       return;
     }
 
-    const partnerPlatform = myBridge.partnerPlatform;
-    const partnerId = myBridge.partnerId;
-
-    myBridge.partnerPlatform = null;
-    myBridge.partnerId = null;
-    myBridge.partnerName = null;
+    myBridge.pendingAction = "unlink";
+    myBridge.pendingExpiresAt = Date.now() + CONFIRM_TTL_MS;
     await saveBridge(env, platform, userId, myBridge);
-
-    const partnerBridge = await getBridge(env, partnerPlatform, partnerId);
-    if (
-      partnerBridge &&
-      partnerBridge.partnerPlatform === platform &&
-      String(partnerBridge.partnerId) === String(userId)
-    ) {
-      partnerBridge.partnerPlatform = null;
-      partnerBridge.partnerId = null;
-      partnerBridge.partnerName = null;
-      await saveBridge(env, partnerPlatform, partnerId, partnerBridge);
-    }
-
-    await sendMessage(
-      env, partnerPlatform, partnerId,
-      "собеседник отвязал мост",
-      partnerPlatform === "tg" ? TG_KEYBOARD : VK_KEYBOARD
-    );
-    await sendMessage(env, platform, chatId, "мост отвязан", keyboard);
+    await sendMessage(env, platform, chatId, CONFIRM_PROMPT, confirmKeyboard);
     return;
   }
 
+  // ---- ввод кода подключения ----
   if (isCodeEntry) {
     const extractedKey = keyMatch[0].toLowerCase();
     const owner = await getOwnerByKey(env, extractedKey);
@@ -619,8 +777,11 @@ async function processMessage(msg, env) {
     if (!myBridge) {
       const key = await generateUniqueKey(env);
       myBridge = {
-        key, myName: username,
-        partnerPlatform: null, partnerId: null, partnerName: null,
+        key,
+        myName: username,
+        partnerPlatform: null,
+        partnerId: null,
+        partnerName: null,
       };
       await saveBridge(env, platform, userId, myBridge);
       await saveOwnerByKey(env, key, { platform, userId });
@@ -667,7 +828,13 @@ async function processMessage(msg, env) {
         ob.partnerId = null;
         ob.partnerName = null;
         await saveBridge(env, op, oid, ob);
-        await sendMessage(env, op, oid, "собеседник нашел другого собеседника", op === "tg" ? TG_KEYBOARD : VK_KEYBOARD);
+        await sendMessage(
+          env,
+          op,
+          oid,
+          "собеседник нашел другого собеседника",
+          op === "tg" ? TG_KEYBOARD : VK_KEYBOARD
+        );
       }
     }
 
@@ -675,12 +842,22 @@ async function processMessage(msg, env) {
       const op2 = ownerBridge.partnerPlatform;
       const oid2 = ownerBridge.partnerId;
       const ob2 = await getBridge(env, op2, oid2);
-      if (ob2 && ob2.partnerPlatform === owner.platform && String(ob2.partnerId) === String(owner.userId)) {
+      if (
+        ob2 &&
+        ob2.partnerPlatform === owner.platform &&
+        String(ob2.partnerId) === String(owner.userId)
+      ) {
         ob2.partnerPlatform = null;
         ob2.partnerId = null;
         ob2.partnerName = null;
         await saveBridge(env, op2, oid2, ob2);
-        await sendMessage(env, op2, oid2, "собеседник нашел другого собеседника", op2 === "tg" ? TG_KEYBOARD : VK_KEYBOARD);
+        await sendMessage(
+          env,
+          op2,
+          oid2,
+          "собеседник нашел другого собеседника",
+          op2 === "tg" ? TG_KEYBOARD : VK_KEYBOARD
+        );
       }
     }
 
@@ -696,19 +873,28 @@ async function processMessage(msg, env) {
 
     await sendMessage(env, platform, chatId, `вы подключены к ${ownerName}`, keyboard);
     await sendMessage(
-      env, owner.platform, owner.userId,
+      env,
+      owner.platform,
+      owner.userId,
       `с вами подключился ${username}`,
       owner.platform === "tg" ? TG_KEYBOARD : VK_KEYBOARD
     );
     return;
   }
 
-  // Обычное сообщение — пересылка
+  // ---- Обычное сообщение — пересылка ----
   if (!myBridge) {
     await sendMessage(env, platform, chatId, ERR_NO_START, keyboard);
     return;
   }
+
+  // Обновляем собственное имя при каждом сообщении
+  if (myBridge.myName !== username) {
+    myBridge.myName = username;
+  }
+
   if (!myBridge.partnerPlatform || myBridge.partnerId === null) {
+    await saveBridge(env, platform, userId, myBridge);
     await sendMessage(env, platform, chatId, ERR_NO_PARTNER, keyboard);
     return;
   }
@@ -729,6 +915,13 @@ async function processMessage(msg, env) {
     await sendMessage(env, platform, chatId, ERR_PARTNER_LEFT, keyboard);
     return;
   }
+
+  // Синхронизируем актуальное имя собеседника у себя
+  const freshPartnerName = partnerBridge.myName || myBridge.partnerName || "собеседник";
+  if (myBridge.partnerName !== freshPartnerName) {
+    myBridge.partnerName = freshPartnerName;
+  }
+  await saveBridge(env, platform, userId, myBridge);
 
   await sendMessage(env, partnerPlatform, partnerId, `сообщение от ${username}: ${text}`);
   await sendMessage(env, platform, chatId, OK_DELIVERED, keyboard);
@@ -786,7 +979,6 @@ export default {
       if (request.method === "POST") {
         const body = await request.json();
 
-        // VK confirmation
         if (body && body.type === "confirmation") {
           return new Response(env.VK_CONFIRMATION_CODE || "", {
             status: 200,
@@ -794,15 +986,10 @@ export default {
           });
         }
 
-        // Telegram
         if (body && body.update_id) {
           const msg = body.message;
           if (!msg) return new Response("OK", { status: 200 });
 
-          const isImageDoc =
-            msg.document &&
-            msg.document.mime_type &&
-            msg.document.mime_type.startsWith("image/");
           const isMedia =
             (msg.photo && msg.photo.length > 0) ||
             msg.document ||
@@ -819,8 +1006,11 @@ export default {
           return new Response("OK", { status: 200 });
         }
 
-        // VK
         if (body && body.type && body.group_id) {
+          if (env.VK_SECRET && body.secret !== env.VK_SECRET) {
+            return new Response("OK", { status: 200 });
+          }
+
           const msg = body.object && body.object.message;
           if (!msg) return new Response("OK", { status: 200 });
 
